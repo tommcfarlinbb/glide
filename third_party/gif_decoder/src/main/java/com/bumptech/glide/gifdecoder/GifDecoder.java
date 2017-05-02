@@ -72,6 +72,12 @@ public class GifDecoder {
      * Unable to fully decode the current frame.
      */
     public static final int STATUS_PARTIAL_DECODE = 3;
+
+    /**
+     * The total iteration count which means repeat forever.
+     */
+    public static final int TOTAL_ITERATION_COUNT_FOREVER = 0;
+
     /**
      * max decoder pixel stack size.
      */
@@ -105,7 +111,10 @@ public class GifDecoder {
 
     // Global File Header values and parsing flags.
     // Active color table.
+    // Maximum size is 256, see GifHeaderParser.readColorTable
     private int[] act;
+    // Private color table that can be modified if needed
+    private final int[] pct = new int[256];
 
     // Raw GIF data from input source.
     private ByteBuffer rawData;
@@ -235,12 +244,65 @@ public class GifDecoder {
     }
 
     /**
-     * Gets the "Netscape" iteration count, if any. A count of 0 means repeat indefinitely.
+     * Gets the "Netscape" loop count, if any. A count of 0 means repeat indefinitely.
      *
-     * @return iteration count if one was specified, else 1.
+     * @deprecated Use {@link #getNetscapeLoopCount()} instead.
+     *             This method cannot distinguish whether the loop count is 1 or doesn't exist.
+     * @return loop count if one was specified, else 1.
      */
+    @Deprecated
     public int getLoopCount() {
+        if (header.loopCount == GifHeader.NETSCAPE_LOOP_COUNT_DOES_NOT_EXIST) {
+            return 1;
+        }
         return header.loopCount;
+    }
+
+    /**
+     * Gets the "Netscape" loop count, if any. A count of 0 ({@link GifHeader#NETSCAPE_LOOP_COUNT_FOREVER})
+     * means repeat indefinitely. It must not be a negative value.
+     * <br>
+     * Use {@link #getTotalIterationCount()} to know how many times the animation sequence should be displayed.
+     *
+     * @return loop count if one was specified,
+     *         else -1 ({@link GifHeader#NETSCAPE_LOOP_COUNT_DOES_NOT_EXIST}).
+     */
+    public int getNetscapeLoopCount() {
+        return header.loopCount;
+    }
+
+    /**
+     * Gets the total count which represents how many times the animation sequence should be displayed.
+     * A count of 0 ({@link #TOTAL_ITERATION_COUNT_FOREVER}) means repeat indefinitely.
+     * It must not be a negative value.
+     * <p>
+     *     The total count is calculated as follows by using {@link #getNetscapeLoopCount()}.
+     *     This behavior is the same as most web browsers.
+     *     <table border='1'>
+     *         <tr class='TableSubHeadingColor'><th>{@code getNetscapeLoopCount()}</th>
+     *             <th>The total count</th></tr>
+     *         <tr><td>{@link GifHeader#NETSCAPE_LOOP_COUNT_FOREVER}</td>
+     *             <td>{@link #TOTAL_ITERATION_COUNT_FOREVER}</td></tr>
+     *         <tr><td>{@link GifHeader#NETSCAPE_LOOP_COUNT_DOES_NOT_EXIST}</td>
+     *             <td>1</td></tr>
+     *         <tr><td>{@code n (n > 0)}</td>
+     *             <td>{@code n +1}</td></tr>
+     *     </table>
+     * </p>
+     *
+     * @see <a href="https://bugs.chromium.org/p/chromium/issues/detail?id=592735#c5">Discussion about
+     *      the iteration count of animated GIFs (Chromium Issue 592735)</a>
+     *
+     * @return total iteration count calculated from "Netscape" loop count.
+     */
+    public int getTotalIterationCount() {
+        if (header.loopCount == GifHeader.NETSCAPE_LOOP_COUNT_DOES_NOT_EXIST) {
+            return 1;
+        }
+        if (header.loopCount == GifHeader.NETSCAPE_LOOP_COUNT_FOREVER) {
+            return TOTAL_ITERATION_COUNT_FOREVER;
+        }
+        return header.loopCount + 1;
     }
 
     /**
@@ -271,21 +333,7 @@ public class GifDecoder {
         }
 
         // Set the appropriate color table.
-        if (currentFrame.lct == null) {
-            act = header.gct;
-        } else {
-            act = currentFrame.lct;
-            if (header.bgIndex == currentFrame.transIndex) {
-                header.bgColor = 0;
-            }
-        }
-
-        int save = 0;
-        if (currentFrame.transparency) {
-            save = act[currentFrame.transIndex];
-            // Set transparent color if specified.
-            act[currentFrame.transIndex] = 0;
-        }
+        act = currentFrame.lct != null ? currentFrame.lct : header.gct;
         if (act == null) {
             if (Log.isLoggable(TAG, Log.DEBUG)) {
                 Log.d(TAG, "No Valid Color Table");
@@ -295,15 +343,17 @@ public class GifDecoder {
             return null;
         }
 
-        // Transfer pixel data to image.
-        Bitmap result = setPixels(currentFrame, previousFrame);
-
-        // Reset the transparent pixel in the color table
         if (currentFrame.transparency) {
-            act[currentFrame.transIndex] = save;
+            // Prepare local copy of color table ("pct = act"), see #1068
+            System.arraycopy(act, 0, pct, 0, act.length);
+            // Forget about act reference from shared header object, use copied version
+            act = pct;
+            // Set transparent color if specified.
+            act[currentFrame.transIndex] = 0;
         }
 
-        return result;
+        // Transfer pixel data to image.
+        return setPixels(currentFrame, previousFrame);
     }
 
     /**
@@ -430,6 +480,11 @@ public class GifDecoder {
         // Final location of blended pixels.
         final int[] dest = mainScratch;
 
+        // clear all pixels when meet first frame
+        if (previousFrame == null) {
+            Arrays.fill(dest, 0);
+        }
+
         // fill in starting image contents based on last image's dispose code
         if (previousFrame != null && previousFrame.dispose > DISPOSAL_UNSPECIFIED) {
             // We don't need to do anything for DISPOSAL_NONE, if it has the correct pixels so will our mainScratch
@@ -439,15 +494,26 @@ public class GifDecoder {
                 int c = 0;
                 if (!currentFrame.transparency) {
                     c = header.bgColor;
+                    if (currentFrame.lct != null && header.bgIndex == currentFrame.transIndex) {
+                        c = 0;
+                    }
                 }
-                Arrays.fill(dest, c);
+                // The area used by the graphic must be restored to the background color.
+                int topLeft = previousFrame.iy * width + previousFrame.ix;
+                int bottomLeft = topLeft + previousFrame.ih * width;
+                for (int left = topLeft; left < bottomLeft; left += width) {
+                    int right = left + previousFrame.iw;
+                    for (int pointer = left; pointer < right; pointer++) {
+                        dest[pointer] = c;
+                    }
+                }
             } else if (previousFrame.dispose == DISPOSAL_PREVIOUS && previousImage != null) {
                 // Start with the previous frame
                 previousImage.getPixels(dest, 0, width, 0, 0, width, height);
             }
         }
 
-        // Decode pixels for this frame  into the global pixels[] scratch.
+        // Decode pixels for this frame into the global pixels[] scratch.
         decodeBitmapData(currentFrame);
 
         // Copy each source line to the appropriate place in the destination.

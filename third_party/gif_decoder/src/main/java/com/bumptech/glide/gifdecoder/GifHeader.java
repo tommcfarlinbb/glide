@@ -10,6 +10,11 @@ import java.util.List;
  */
 public class GifHeader {
 
+    /** The "Netscape" loop count which means loop forever. */
+    public static final int NETSCAPE_LOOP_COUNT_FOREVER = 0;
+    /** Indicates that this header has no "Netscape" loop count. */
+    public static final int NETSCAPE_LOOP_COUNT_DOES_NOT_EXIST = -1;
+
     int[] gct = null;
     int status = GifDecoder.STATUS_OK;
     int frameCount = 0;
@@ -32,9 +37,8 @@ public class GifHeader {
     int bgIndex;
     // Pixel aspect ratio.
     int pixelAspect;
-    //TODO: this is set both during reading the header and while decoding frames...
     int bgColor;
-    int loopCount;
+    int loopCount = NETSCAPE_LOOP_COUNT_DOES_NOT_EXIST;
 
     public int getHeight() {
         return height;
